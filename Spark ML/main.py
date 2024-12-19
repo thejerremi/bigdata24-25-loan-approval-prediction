@@ -7,6 +7,9 @@ from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 from pyspark.ml import Pipeline
 from kafka import KafkaProducer, KafkaConsumer
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 import json
 import threading
 import traceback
@@ -94,36 +97,35 @@ class LoanPredictionKafkaHandler:
 
         lr = LogisticRegression(featuresCol="scaledFeatures", labelCol="loan_status")
 
-        # trenowanie modelu
         lr_model = lr.fit(train_data)
 
-        # przewidywanie wyników na danych testowych
         y_pred = lr_model.transform(test_data)
 
-        y_pred.select("loan_status", "prediction", "probability").show()
+        confusion_matrix = y_pred.groupBy("loan_status", "prediction").count()
 
-        # dokładność
-        evaluator = MulticlassClassificationEvaluator(labelCol="loan_status", predictionCol="prediction",
-                                                      metricName="accuracy")
-        accuracy = evaluator.evaluate(y_pred)
+        cm_df = pd.DataFrame(confusion_matrix.collect(), columns=["loan_status", "prediction", "count"])
+        cm_pivot = cm_df.pivot(index="loan_status", columns="prediction", values="count").fillna(0).astype(int)
+
+        print("Confusion Matrix (DataFrame):")
+        print(cm_pivot)
+
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm_pivot, annot=True, fmt="d", cmap="Blues", cbar=False)
+        plt.xlabel("Predicted")
+        plt.ylabel("Actual")
+        plt.title("Confusion Matrix")
+        plt.show()
+
+        evaluator = MulticlassClassificationEvaluator(labelCol="loan_status", predictionCol="prediction")
+        accuracy = evaluator.evaluate(y_pred, {evaluator.metricName: "accuracy"})
+        weighted_precision = evaluator.evaluate(y_pred, {evaluator.metricName: "weightedPrecision"})
+        weighted_recall = evaluator.evaluate(y_pred, {evaluator.metricName: "weightedRecall"})
+        f1_score = evaluator.evaluate(y_pred, {evaluator.metricName: "f1"})
+
         print(f"Accuracy: {accuracy}")
-
-        # precyzja
-        evaluator_precision = MulticlassClassificationEvaluator(labelCol="loan_status", predictionCol="prediction",
-                                                                metricName="weightedPrecision")
-        precision = evaluator_precision.evaluate(y_pred)
-
-        evaluator_recall = MulticlassClassificationEvaluator(labelCol="loan_status", predictionCol="prediction",
-                                                             metricName="weightedRecall")
-        recall = evaluator_recall.evaluate(y_pred)
-
-        print(f"Precision: {precision}, Recall: {recall}")
-
-        from pyspark.ml.evaluation import BinaryClassificationEvaluator
-        evaluator_roc = BinaryClassificationEvaluator(labelCol="loan_status", rawPredictionCol="probability",
-                                                      metricName="areaUnderROC")
-        auc = evaluator_roc.evaluate(y_pred)
-        print(f"AUC: {auc}")
+        print(f"Precision: {weighted_precision}")
+        print(f"Recall: {weighted_recall}")
+        print(f"F1 Score: {f1_score}")
 
         return lr_model
 
@@ -204,9 +206,40 @@ class LoanPredictionKafkaHandler:
         consumer_thread.start()
         return consumer_thread
 
+    def plot_feature_correlation(self):
+        # Wybór kolumn liczbowych i kategorycznych
+        numeric_columns = [col for col in self.feature_columns if self.data.schema[col].dataType.typeName() != 'string']
+        categorical_columns = [col for col in self.feature_columns if
+                               self.data.schema[col].dataType.typeName() == 'string']
+
+        # Sprawdzenie, które kolumny kategoryczne zostały już przekształcone
+        existing_columns = self.data.columns
+        for col in categorical_columns:
+            index_col = f"{col}_index"
+            if index_col not in existing_columns:
+                indexer = StringIndexer(inputCol=col, outputCol=index_col).fit(self.data)
+                self.data = indexer.transform(self.data)
+
+        # Wybór kolumn do analizy korelacji
+        correlation_columns = numeric_columns + [f"{col}_index" for col in categorical_columns]
+
+        # Przekształcenie do Pandas DataFrame
+        pandas_df = self.data.select(*correlation_columns).toPandas()
+
+        # Obliczanie korelacji
+        correlation_matrix = pandas_df.corr()
+
+        # Wizualizacja korelacji
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(correlation_matrix, annot=True, fmt=".2f", cmap="coolwarm", cbar=True)
+        plt.title("Feature Correlation Matrix")
+        plt.show()
+
 
 if __name__ == "__main__":
     kafka_handler = LoanPredictionKafkaHandler()
+
+    kafka_handler.plot_feature_correlation()
 
     consumer_thread = kafka_handler.start_consumer()
 
